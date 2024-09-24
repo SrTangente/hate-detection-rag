@@ -1,0 +1,7 @@
+chromadb
+langchain
+langchain_ollama
+pandas
+openpyxl
+uuid
+flask
