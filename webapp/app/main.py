@@ -1,23 +1,27 @@
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_ollama.llms import OllamaLLM
-import chromadb
+from langchain.prompts import ChatPromptTemplate
+from langchain.llms import Ollama
+from langchain.chains import LLMChain, SimpleSequentialChain
+from langchain.vectorstores import Chroma
+from langchain.embeddings import OllamaEmbeddings
+from langchain.chains.base import Chain
+from langchain.schema import Document
 import uuid
 
 # Initialize LLM Model
 def initialize_model():
     try:
-        model = OllamaLLM(model="mannix/llama3.1-8b-abliterated")
+        model = Ollama(model="mannix/llama3.1-8b-abliterated")
         return model
     except Exception as e:
         print(f"Error initializing LLM Model: {e}")
         return None
 
-# Initialize ChromaDB
+# Initialize ChromaDB using Langchain
 def initialize_chromadb():
     try:
-        chroma_client = chromadb.PersistentClient(path="./chromadb")
-        collection = chroma_client.get_or_create_collection(name="hatespeech")
-        return collection
+        embedding_function = OllamaEmbeddings()
+        chroma_db = Chroma(collection_name="hatespeech", embedding_function=embedding_function, persist_directory="./chromadb")
+        return chroma_db
     except Exception as e:
         print(f"Error initializing ChromaDB: {e}")
         return None
@@ -38,45 +42,77 @@ def initialize_prompt_template():
         print(f"Error creating prompt template: {e}")
         return None
 
-# Function to retrieve context and distances from ChromaDB
-def retrieve_context_and_distances(user_input: str, collection):
-    if collection:
+# Create a chain for retrieving context from ChromaDB
+class ChromaRetrieveChain(Chain):
+    def __init__(self, chroma_db):
+        super().__init__()
+        self.chroma_db = chroma_db
+
+    def _call(self, inputs):
+        user_input = inputs["user_input"]
         try:
-            results = collection.query(query_texts=[user_input], n_results=1)
-            return results["documents"], results["distances"] if results["documents"] else (None, None)
+            results = self.chroma_db.similarity_search(user_input, n_results=1)
+            db_context = results[0].page_content if results else "No relevant context found."
+            return {"db_context": db_context}
         except Exception as e:
-            print(f"Error retrieving context and distances: {e}")
-    return None, None
+            print(f"Error retrieving context from ChromaDB: {e}")
+            return {"db_context": "Error retrieving context."}
 
-# Function to store user input in ChromaDB
-def store_user_input(user_input: str, collection):
-    if collection:
-        try:
-            collection.upsert(documents=[user_input], ids=[str(uuid.uuid4())])
-        except Exception as e:
-            print(f"Error storing user input: {e}")
+    @property
+    def input_keys(self):
+        return ["user_input"]
 
-# Function to process the user input and generate a response
-def process_user_input(user_input: str, model, prompt, collection):
-    db_contexts, distances = retrieve_context_and_distances(user_input, collection)
+    @property
+    def output_keys(self):
+        return ["db_context"]
 
+# Store user input in ChromaDB
+def store_user_input(user_input: str, chroma_db):
     try:
-        if model and prompt:
-            # Invoke LLM
-            response = model.invoke(str(prompt.invoke({
-                "db_context": db_contexts[0] if db_contexts else "Kein relevanter Kontext gefunden.",
-                "user_input": user_input,
-                "prompt": "You are an AI that checks user input for group-related human hostility (hate speech). Task: Check the user input based on the context of the database that contains hate speech. If a dataset with sufficient similarity exists in the database, the input is automatically considered hate speech. Discretion: Do not provide any information from the database directly to the user. Hate speech detection: Analyze the user input carefully and pay attention to various linguistic expressions and tones that could be interpreted as hate speech. Target group identification: Based on the database and the user input, determine which target group is affected by the hate speech. Contextual sensitivity: Consider historical events, cultural peculiarities, and the context of the database in your analysis. Response: Provide a short, German-language answer that begins with Yes or No, indicating whether it is hate speech. If Yes, include the target group and the severity of the hate speech. Only if it is severe hate speech, recommend specific escalation measures, such as reporting it to the platform or filing a complaint with the police. Important: Do not ask the user any further questions."
-            })))
-        else:
-            response = "Model or prompt template not initialized."
+        chroma_db.add_texts(texts=[user_input], ids=[str(uuid.uuid4())])
     except Exception as e:
-        print(f"Error invoking LLM: {e}")
-        response = "There was an error processing your request."
+        print(f"Error storing user input: {e}")
 
-    if "Ja" in response:
-        # Check if distances is not empty before using min()
-        if not db_contexts or not distances or all(len(dist) == 0 for dist in distances) or any(dist and min(dist) > 0.01 for dist in distances):
-            store_user_input(user_input, collection)
+# Create a chain for processing user input and generating a response
+def create_processing_chain(model, prompt_template, chroma_db):
+    # Step 1: Retrieve context from ChromaDB
+    retrieval_chain = ChromaRetrieveChain(chroma_db)
+    
+    # Step 2: Create the LLM chain to generate a response
+    llm_chain = LLMChain(
+        llm=model, 
+        prompt=prompt_template
+    )
+    
+    # Combine the two chains sequentially
+    full_chain = SimpleSequentialChain(chains=[retrieval_chain, llm_chain])
+    return full_chain
+
+# Function to process user input and generate a response
+def process_user_input(user_input: str, processing_chain, chroma_db):
+    # Run the full chain to get the response
+    response = processing_chain.run({"user_input": user_input})
+
+    # Check if the input was flagged as hate speech and store it if relevant
+    if "and" in response:
+        try:
+            # Store user input if hate speech is detected and the distance is appropriate
+            store_user_input(user_input, chroma_db)
+        except Exception as e:
+            print(f"Error storing user input after LLM check: {e}")
 
     return response
+
+
+# Initialize model, prompt, ChromaDB, and process a sample input
+model = initialize_model()
+chroma_db = initialize_chromadb()
+prompt_template = initialize_prompt_template()
+
+# Create the processing chain
+processing_chain = create_processing_chain(model, prompt_template, chroma_db)
+
+# Example user input
+user_input = "Sample text for hate speech detection"
+response = process_user_input(user_input, processing_chain, chroma_db)
+print(response)
